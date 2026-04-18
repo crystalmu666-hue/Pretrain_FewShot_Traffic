@@ -1,0 +1,9 @@
+*.npy
+*.csv
+data/processed/
+data/raw/
+*.pth
+*.pt
+checkpoints/
+*.log
+logs/

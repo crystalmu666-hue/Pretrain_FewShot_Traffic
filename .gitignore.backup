@@ -1,0 +1,6 @@
+data/processed/*.npy
+data/processed/*.npz
+data/raw/*.csv
+*.pcap_ISCX.csv
+results/data/*.npy
+results/plots/*.png
