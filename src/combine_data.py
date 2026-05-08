@@ -3,7 +3,7 @@ import os
 
 # 1. 设置路径
 raw_dir = "data/raw"
-output_path = os.path.join(raw_dir, "CICIDS2017_all.csv")
+output_path = os.path.join(raw_dir, "  .csv")
 
 # 2. 获取目录下所有的 CSV 文件
 # 关键过滤：文件名必须包含 'pcap' 或 'ISCX' (这是 CICIDS 的特征)，且不能包含 'UNSW'

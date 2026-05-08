@@ -1,96 +1,173 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import os
+import json
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
-# ==========================================
-# 1. 实验配置 (符合任务书规范性要求)
-# ==========================================
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
+# =========================================================
+# UNSW 列名
+# =========================================================
+UNSW_COLUMNS = [
+    "srcip","sport","dstip","dsport","proto","state","dur",
+    "sbytes","dbytes","sttl","dttl","sloss","dloss","service",
+    "Sload","Dload","Spkts","Dpkts","swin","dwin","stcpb","dtcpb",
+    "smeansz","dmeansz","trans_depth","res_bdy_len","Sjit","Djit",
+    "Stime","Ltime","Sintpkt","Dintpkt","tcprtt","synack","ackdat",
+    "is_sm_ips_ports","ct_state_ttl","ct_flw_http_mthd","is_ftp_login",
+    "ct_ftp_cmd","ct_srv_src","ct_srv_dst","ct_dst_ltm","ct_src_ltm",
+    "ct_src_dport_ltm","ct_dst_sport_ltm","ct_dst_src_ltm",
+    "attack_cat","label"
+]
 
-def preprocess_pipeline(file_path, output_dir, is_pretrain=False):
-    print(f"\n[开始处理] {os.path.basename(file_path)}")
+# =========================================================
+# 通用特征处理
+# =========================================================
+def process_features(df, label_col):
+    y = df[label_col].astype(str)
+    y = y.replace(['nan', 'None', ''], np.nan)
 
-    # 1. 加载数据
-    df = pd.read_csv(file_path, low_memory=False)
+    mask = ~y.isna()
+    df = df[mask]
+    y = y[mask]
 
-    # 2. 标签锁定
-    label_col = ' Label' if ' Label' in df.columns else ('Label' if 'Label' in df.columns else df.columns[-1])
+    X = df.drop(columns=[label_col])
 
-    # 3. 核心：彻底清洗异常值 (解决 Infinity 报错)
-    # 将所有列转为数值，无法转换的变 NaN
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if label_col in numeric_cols:
-        numeric_cols.remove(label_col)
+    # 删除高风险字段
+    drop_cols = ['srcip', 'dstip', 'sport', 'dsport', 'Stime', 'Ltime']
+    X = X.drop(columns=drop_cols, errors='ignore')
 
-    X = df[numeric_cols].copy()
+    # 分类特征 → Frequency Encoding（仅用训练集）
+    cat_cols = X.select_dtypes(include=['object']).columns
+    X_cat = pd.DataFrame(index=X.index)
 
-    # 将无穷大 (inf) 替换为 NaN，然后统一删除
-    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    # 先划分临时训练集索引用于频率编码
+    train_idx, _ = train_test_split(np.arange(len(X)), test_size=0.2, stratify=y, random_state=RANDOM_SEED)
 
-    # 合并标签一起删，确保行数对应
-    temp_df = pd.concat([X, df[label_col]], axis=1)
-    temp_df.dropna(inplace=True)  # 删除所有包含 NaN 或 inf 的行
+    for col in cat_cols:
+        freq = X[col].iloc[train_idx].value_counts(normalize=True)
+        X[col] = X[col].map(freq).fillna(0)
+        X_cat[col] = X[col]
 
-    X = temp_df.iloc[:, :-1]
-    y = temp_df.iloc[:, -1]
+    # 数值特征
+    num_cols = X.select_dtypes(exclude=['object']).columns
+    X_num = X[num_cols].apply(pd.to_numeric, errors='coerce')
 
-    print(f"确认标签列为: {label_col}, 包含类别数: {len(np.unique(y))}")
-    print(f"数据清洗完成，剩余样本数: {len(X)}")
+    X_num = X_num.replace([np.inf, -np.inf], np.nan)
+    for col in X_num.columns:
+        X_num[col] = X_num[col].fillna(X_num[col].median())
+        q1 = X_num[col].quantile(0.01)
+        q99 = X_num[col].quantile(0.99)
+        X_num[col] = X_num[col].clip(q1, q99)
 
-    # 4. 标准化 (现在不会报错了)
+    # 合并
+    X_all = pd.concat([X_num, X_cat], axis=1)
+    return X_all, y
+
+# =========================================================
+# Few-shot 构造
+# =========================================================
+def create_fewshot(X, y, out_dir):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+        stratify=y
+    )
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    np.savez(os.path.join(out_dir, "test_set.npz"), x=X_test, y=y_test)
+
+    # 按类别索引
+    class_indices = {cls: np.where(y_train == cls)[0] for cls in np.unique(y_train)}
+
+    ratios = [0.001, 0.01, 0.05, 0.1]
+    seeds = [42, 52, 62]  # 可扩展多随机种子
+
+    for r in ratios:
+        for seed in seeds:
+            np.random.seed(seed)
+            X_sub_list, y_sub_list = [], []
+
+            for cls, indices in class_indices.items():
+                n_cls = min(len(indices), max(2, int(len(indices) * r)))
+                selected = np.random.choice(indices, n_cls, replace=False)
+                X_sub_list.append(X_train[selected])
+                y_sub_list.append(y_train[selected])
+
+            X_sub = np.vstack(X_sub_list)
+            y_sub = np.concatenate(y_sub_list)
+
+            perm = np.random.permutation(len(X_sub))
+            X_sub = X_sub[perm]
+            y_sub = y_sub[perm]
+
+            print(f"Ratio {int(r*100)}% | Seed {seed} | 样本数: {len(X_sub)} | 类别数: {len(np.unique(y_sub))}")
+
+            np.savez(os.path.join(out_dir, f"cicids_{int(r*100)}_seed{seed}.npz"), x=X_sub, y=y_sub)
+
+# =========================================================
+# UNSW 预训练
+# =========================================================
+def preprocess_unsw(path, out_dir):
+    print("\n[UNSW] loading...")
+    df = pd.read_csv(path, header=None, low_memory=False)
+    df.columns = UNSW_COLUMNS
+    label_col = "attack_cat"
+    X, y = process_features(df, label_col)
+
+    labels = sorted(y.unique())
+    label_map = {l: i for i, l in enumerate(labels)}
+    y_encoded = y.map(label_map).values
+
+    with open(os.path.join(out_dir, "unsw_label_map.json"), "w") as f:
+        json.dump(label_map, f)
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    if is_pretrain:
-        np.save(os.path.join(output_dir, "unsw_pretrain.npy"), X_scaled)
-        print("√ UNSW 预训练数据已保存")
-    else:
-        # 5. 分层抽样 (必须有 2 类以上才能跑)
-        y_encoded, _ = pd.factorize(y)
-        unique_classes = np.unique(y_encoded)
+    print("UNSW shape:", X_scaled.shape)
+    print("UNSW classes:", len(label_map))
 
-        if len(unique_classes) < 2:
-            print(f"!!! 警告：{os.path.basename(file_path)} 仅含单一类别，无法进行分类实验！")
-            print(f"建议：请确认使用的是否为 Wednesday 或 Thursday 的数据，Monday 通常只有正常流量。")
-            return  # 跳过保存，防止生成错误文件
+    np.save(os.path.join(out_dir, "unsw_X.npy"), X_scaled)
+    np.save(os.path.join(out_dir, "unsw_y.npy"), y_encoded)
+    print("[UNSW] done")
 
-        for r in [0.01, 0.05, 0.10]:
-            _, X_sub, _, y_sub = train_test_split(
-                X_scaled, y_encoded, test_size=r, random_state=42, stratify=y_encoded
-            )
-            np.savez(os.path.join(output_dir, f"cicids_{int(r * 100)}pct.npz"), x=X_sub, y=y_sub)
-            print(f"v 已生成 {int(r * 100)}% 子集")
-# ==========================================
-# 主程序入口
-# ==========================================
+# =========================================================
+# CICIDS 下游任务
+# =========================================================
+def preprocess_cicids(path, out_dir):
+    print("\n[CICIDS]")
+    df = pd.read_csv(path, low_memory=False)
+    label_col = ' Label' if ' Label' in df.columns else 'Label'
+    X, y = process_features(df, label_col)
+
+    labels = sorted(y.unique())
+    label_map = {l: i for i, l in enumerate(labels)}
+    y_encoded = y.map(label_map).values
+
+    with open(os.path.join(out_dir, "cicids_label_map.json"), "w") as f:
+        json.dump(label_map, f)
+
+    print("类别分布:", np.bincount(y_encoded))
+    create_fewshot(X.values, y_encoded, out_dir)
+
+# =========================================================
+# main
+# =========================================================
 if __name__ == "__main__":
-    # 获取当前工作目录，确保路径绝对化
-    BASE_DIR = os.getcwd()
-    RAW_DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
-    PROCESSED_DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+    BASE = os.getcwd()
+    RAW = os.path.join(BASE, "data", "raw")
+    OUT = os.path.join(BASE, "data", "processed")
+    os.makedirs(OUT, exist_ok=True)
 
-    # 自动创建输出文件夹
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-
-    print("=== 网络流量小样本学习：数据工程阶段 ===")
-
-    # 任务 1: 处理 UNSW-NB15 用于无监督预训练 (第3-4周)
-    preprocess_pipeline(
-        os.path.join(RAW_DATA_DIR, "UNSW-NB15.csv"),
-        PROCESSED_DATA_DIR,
-        is_pretrain=True
-    )
-
-    # 任务 2: 处理 CICIDS2017 用于小样本微调 (第5周)
-    preprocess_pipeline(
-        os.path.join(RAW_DATA_DIR, "CICIDS2017_all.csv"),
-        PROCESSED_DATA_DIR,
-        is_pretrain=False
-    )
-
-    print("\n[所有检查点已完成]")
-    print(f"最终输出清单: {os.listdir(PROCESSED_DATA_DIR)}")
+    print("=== CLEAN PIPELINE START ===")
+    preprocess_unsw(os.path.join(RAW, "UNSW-NB15.csv"), OUT)
+    preprocess_cicids(os.path.join(RAW, "CICIDS2017_all.csv"), OUT)
+    print("\n✅ DONE")

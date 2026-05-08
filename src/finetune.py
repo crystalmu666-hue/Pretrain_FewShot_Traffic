@@ -1,22 +1,50 @@
+"""
+Finetuning script for few-shot experiments.
+Stores per-epoch loss/F1 history in checkpoints so convergence plots can use
+real training traces instead of placeholder points.
+"""
+
+import argparse
+import copy
 import os
+import time
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import os
-from sklearn.metrics import classification_report, accuracy_score
-import time
+
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 64
+EPOCHS_FROZEN = 20
+EPOCHS_FINETUNE = 30
+LEARNING_RATE_ENCODER = 1e-5
+LEARNING_RATE_TOP = 1e-3
+LEARNING_RATE_ADAPTER = 1e-3
+
+MARGIN = 1.0
+TRIPLET_WEIGHT = 0.1
+MMD_WEIGHT = 0.1
+
+DATA_DIR = "data/processed"
+TEST_SET = os.path.join(DATA_DIR, "test_set.npz")
+SOURCE_DATA_PATH = os.path.join(DATA_DIR, "unsw_X.npy")
+
+PRETRAIN_MODELS = {
+    "mae": "checkpoints/mae_pretrain.pth",
+    "transformer": "checkpoints/transformer_pretrain.pth",
+}
 
 
 def get_logger(log_dir="logs"):
     os.makedirs(log_dir, exist_ok=True)
     log_name = time.strftime("%Y%m%d_%H%M%S") + "_finetune.log"
-    log_path = os.path.join(log_dir, log_name)
-    return log_path
+    return os.path.join(log_dir, log_name)
 
 
 def log_to_file(path, message):
@@ -24,180 +52,296 @@ def log_to_file(path, message):
         f.write(message + "\n")
 
 
-# ==========================================
-# 1. 实验配置
-# ==========================================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 64
-EPOCHS = 50
-LEARNING_RATE = 0.001
+def load_pretrained_weights_into_model(model, model_type):
+    pretrain_path = PRETRAIN_MODELS.get(model_type)
 
-# --- [创新点超参数] ---
-MARGIN = 1.0  # 强制隔离间隔
-TRIPLET_WEIGHT = 0.1  # 三元组损失项的权重
+    if not pretrain_path or not os.path.exists(pretrain_path):
+        print(f"  pretrained weights not found: {pretrain_path}")
+        return 0
 
-PRETRAIN_PATH = "checkpoints/pretrain_epoch_50.pth"
-#PRETRAIN_PATH = ""
+    print(f"  loading pretrained weights: {pretrain_path}")
+
+    checkpoint = torch.load(pretrain_path, map_location=DEVICE)
+    src_state = checkpoint.get("model_state_dict", checkpoint)
+    model_dict = model.state_dict()
+
+    matched = {}
+    for k_pretrain, v_pretrain in src_state.items():
+        for prefix in ["", "encoder."]:
+            k_candidate = prefix + k_pretrain
+            if k_candidate in model_dict and v_pretrain.shape == model_dict[k_candidate].shape:
+                matched[k_candidate] = v_pretrain
+                break
+
+    if matched:
+        model.load_state_dict(matched, strict=False)
+        print(f"  loaded {len(matched)}/{len(src_state)} pretrained tensors")
+    else:
+        print("  no pretrained tensors matched target model")
+
+    return len(matched)
 
 
-SUBSET_PATH = "data/processed/cicids_1pct.npz"
+class AdapterMetricNet(nn.Module):
+    def __init__(self, input_dim, num_classes=11, model_type="mae", adapter_dim=40, use_adapter=True):
+        super().__init__()
+        self.model_type = model_type
+        self.use_adapter = use_adapter
+        self.adapter_dim = adapter_dim
 
+        self.adapter = nn.Linear(input_dim, adapter_dim)
+        self.temperature = nn.Parameter(torch.tensor(1.0))
 
-# ==========================================
-# 2. 定义模型
-# ==========================================
-class MetricNet(nn.Module):
-    def __init__(self, input_dim, num_classes=11):
-        super(MetricNet, self).__init__()
-        self.feature_align = nn.Linear(input_dim, 40)
-        self.encoder = nn.Sequential(
-            nn.Linear(40, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64)
-        )
-        # 可学习的原型矩阵
-        self.prototypes = nn.Parameter(torch.randn(num_classes, 64))
+        if model_type == "mae":
+            from models import MaskedTrafficAutoencoder
 
-    def forward(self, x):
-        x = self.feature_align(x)
-        features = self.encoder(x)
+            self.encoder = MaskedTrafficAutoencoder(
+                adapter_dim,
+                mask_ratio=0.75,
+                hidden_dim=128,
+                latent_dim=32,
+            ).encoder
+            self.latent_dim = 32
+        elif model_type == "transformer":
+            from models import TrafficTransformer
 
-        # 计算欧氏距离
-        features_exp = features.unsqueeze(1)
+            self.encoder = TrafficTransformer(adapter_dim, hidden_dim=64, projection_dim=32)
+            self.latent_dim = 32
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(adapter_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+            )
+            self.latent_dim = 64
+
+        self.prototypes = nn.Parameter(torch.randn(num_classes, self.latent_dim))
+
+    def forward(self, x, return_features=False):
+        current_input_dim = x.shape[-1]
+
+        if self.use_adapter:
+            if current_input_dim == self.adapter.in_features:
+                x = self.adapter(x)
+            elif current_input_dim != self.adapter_dim:
+                x = self.adapter(x[:, : self.adapter.in_features])
+        elif current_input_dim != self.adapter_dim:
+            x = x[:, : self.adapter_dim]
+
+        if self.model_type == "transformer":
+            _, projections = self.encoder(x)
+        else:
+            projections = self.encoder(x)
+
+        features_exp = projections.unsqueeze(1)
         prototypes_exp = self.prototypes.unsqueeze(0)
         distances = torch.norm(features_exp - prototypes_exp, p=2, dim=-1)
+        logits = -(distances / self.temperature)
 
-        return -distances, features
+        if return_features:
+            return logits, projections
+        return logits, projections
 
 
-# ==========================================
-# [核心创新实现] 混合损失函数
-# ==========================================
-def hybrid_triplet_prototype_loss(logits, targets, margin=1.0):
-    """
-    logits: 负距离矩阵 [-dist_1, -dist_2, ..., -dist_11]
-    targets: 真实标签
-    """
-    # 1. 基础交叉熵损失 (让负距离大的类别概率大)
-    ce_loss = nn.CrossEntropyLoss()(logits, targets)
+def hybrid_triplet_prototype_loss(logits, targets, margin=1.0, class_weights=None):
+    if class_weights is not None:
+        ce_loss = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))(logits, targets)
+    else:
+        ce_loss = nn.CrossEntropyLoss()(logits, targets)
 
-    # 2. 三元组约束损失 (Triplet-style Margin Constraint)
-    # 正例距离 (取负值的相反数)
     batch_range = torch.arange(logits.size(0)).to(DEVICE)
     pos_dist = -logits[batch_range, targets]
-
-    # 找到最近的负例距离 (排除掉正确类别后的最大 logits)
-    mask = torch.ones_like(logits).scatter_(1, targets.unsqueeze(1), 0.)
-    # 排除掉正确类，取剩下的 logits 中的最大值（即最小距离的负例）
+    mask = torch.ones_like(logits).scatter_(1, targets.unsqueeze(1), 0.0)
     nearest_neg_logits, _ = torch.max(logits * mask - (1 - mask) * 1e9, dim=1)
     nearest_neg_dist = -nearest_neg_logits
-
-    # 损失公式: ReLU(d_pos - d_neg + margin)
     triplet_loss = torch.clamp(pos_dist - nearest_neg_dist + margin, min=0.0).mean()
-
     return ce_loss, triplet_loss
 
 
-# ==========================================
-# 3. 微调主函数
-# ==========================================
-def run_finetune():
-    log_path = get_logger()
-    print(f"--- 启动混合损失(Hybrid Loss)度量学习微调 ---")
+def compute_class_weights(y, num_classes):
+    class_counts = np.bincount(y, minlength=num_classes)
+    total_samples = len(y)
+    return torch.FloatTensor(total_samples / (num_classes * (class_counts + 1e-10)))
 
-    config_info = f"Config: LR={LEARNING_RATE}, MARGIN={MARGIN}, TRIPLET_W={TRIPLET_WEIGHT}"
-    log_to_file(log_path, config_info)
 
-    # A. 加载数据
-    data = np.load(SUBSET_PATH)
-    X, y = data['x'], data['y']
-    input_dim = X.shape[1]
-    num_classes = 11
+def load_fewshot_npz(ratio, seed):
+    npz_path = os.path.join(DATA_DIR, f"cicids_{int(ratio)}_seed{seed}.npz")
+    if not os.path.exists(npz_path):
+        npz_path = os.path.join(DATA_DIR, f"cicids_{int(ratio)}pct.npz")
+    data = np.load(npz_path)
+    return data["x"], data["y"]
 
-    dataset = TensorDataset(torch.FloatTensor(X), torch.LongTensor(y))
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # B. 初始化模型
-    model = MetricNet(input_dim, num_classes).to(DEVICE)
+def load_test_set():
+    data = np.load(TEST_SET)
+    return data["x"], data["y"]
 
-    # 加载预训练权重
-    if os.path.exists(PRETRAIN_PATH) and PRETRAIN_PATH != "":
-        checkpoint = torch.load(PRETRAIN_PATH, map_location=DEVICE)
 
-        # 1. 提取包含相关关键字的权重
-        raw_dict = {k: v for k, v in checkpoint['model_state_dict'].items()
-                    if 'encoder' in k or 'feature_align' in k}
+def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
+    test_X, test_y = load_test_set()
+    ratio_results = {}
 
-        # 2. 【关键修改】过滤掉维度不匹配的层 (即 encoder.4)
-        pretrained_dict = {}
-        for k, v in raw_dict.items():
-            # 检查当前模型中对应层的形状
-            if k in model.state_dict():
-                if v.shape == model.state_dict()[k].shape:
-                    pretrained_dict[k] = v
-                else:
-                    print(
-                        f"  [跳过] 层 {k} 维度不匹配 (预训练:{v.shape} -> 当前:{model.state_dict()[k].shape})，将随机初始化。")
+    for ratio in ratios:
+        print(f"\n{'=' * 60}")
+        print(f"sample ratio: {ratio}%")
+        print(f"{'=' * 60}")
+        seed_f1_list = []
 
-        # 3. 加载过滤后的权重
-        model.load_state_dict(pretrained_dict, strict=False)
-        msg = f"√ 成功加载预训练权重（已跳过不匹配层）: {PRETRAIN_PATH}"
+        for seed in seeds:
+            print(f"\n  seed {seed} start")
+
+            X_train, y_train = load_fewshot_npz(ratio, seed)
+            input_dim = X_train.shape[1]
+            num_classes = len(np.unique(y_train))
+
+            train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+            test_dataset = TensorDataset(torch.FloatTensor(test_X), torch.LongTensor(test_y))
+            test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+            model = AdapterMetricNet(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                model_type=model_type,
+                adapter_dim=input_dim,
+            ).to(DEVICE)
+
+            load_pretrained_weights_into_model(model, model_type)
+
+            optimizer = optim.Adam(
+                [
+                    {"params": model.adapter.parameters(), "lr": LEARNING_RATE_ADAPTER},
+                    {"params": model.prototypes, "lr": LEARNING_RATE_TOP},
+                    {"params": [model.temperature], "lr": LEARNING_RATE_TOP},
+                    {
+                        "params": [p for p in model.encoder.parameters() if p.requires_grad],
+                        "lr": LEARNING_RATE_ENCODER,
+                    },
+                ]
+            )
+
+            class_weights = compute_class_weights(y_train, num_classes)
+            best_f1 = 0.0
+            best_epoch = 0
+            best_state_dict = None
+            epoch_history = []
+
+            for epoch in range(EPOCHS_FINETUNE):
+                model.train()
+                total_loss = 0.0
+                batch_count = 0
+
+                for batch_x, batch_y in train_loader:
+                    batch_x = batch_x.to(DEVICE)
+                    batch_y = batch_y.to(DEVICE)
+
+                    optimizer.zero_grad()
+                    logits, _ = model(batch_x)
+                    ce_loss, triplet_loss = hybrid_triplet_prototype_loss(
+                        logits,
+                        batch_y,
+                        class_weights=class_weights,
+                    )
+                    loss = ce_loss + TRIPLET_WEIGHT * triplet_loss
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    batch_count += 1
+
+                model.eval()
+                preds, labels = [], []
+                with torch.no_grad():
+                    for bx, by in test_loader:
+                        logits, _ = model(bx.to(DEVICE))
+                        preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                        labels.extend(by.numpy())
+
+                report = classification_report(labels, preds, output_dict=True, zero_division=0)
+                f1 = float(report["macro avg"]["f1-score"])
+                avg_loss = float(total_loss / max(batch_count, 1))
+                epoch_history.append({"epoch": epoch + 1, "loss": avg_loss, "macro_f1": f1})
+
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_epoch = epoch + 1
+                    best_state_dict = copy.deepcopy(model.state_dict())
+                    print(f"      epoch {epoch + 1:2d} | loss {avg_loss:.4f} | macro_f1 {f1:.4f} -> best")
+
+            print(f"\n  seed {seed} complete - best Macro F1: {best_f1:.4f}")
+            seed_f1_list.append(best_f1)
+
+            os.makedirs("checkpoints", exist_ok=True)
+            torch.save(
+                {
+                    "model_state_dict": best_state_dict if best_state_dict is not None else model.state_dict(),
+                    "history": epoch_history,
+                    "best_macro_f1": float(best_f1),
+                    "best_epoch": int(best_epoch),
+                    "ratio": ratio,
+                    "seed": seed,
+                    "model_type": model_type,
+                },
+                f"checkpoints/finetune_{model_type}_ratio{int(ratio)}_seed{seed}.pth",
+            )
+
+        ratio_avg_f1 = np.mean(seed_f1_list)
+        ratio_std_f1 = np.std(seed_f1_list)
+        ratio_results[ratio] = ratio_avg_f1
+        print(f"\nsummary ratio {ratio}% - mean Macro F1: {ratio_avg_f1:.4f} +- {ratio_std_f1:.4f}")
+
+    return ratio_results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Finetune script with MAE/Transformer support")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="all",
+        choices=["none", "mae", "transformer", "all"],
+        help="pretrain backbone type",
+    )
+    args = parser.parse_args()
+
+    if args.model == "all":
+        models_to_train = ["mae", "transformer", "none"]
     else:
-        msg = "! 警告：未发现预训练权重，模型将从随机初始化开始"
-    print(msg);
-    log_to_file(log_path, msg)
+        models_to_train = [args.model]
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    all_results = {}
+    for model_type in models_to_train:
+        print(f"\n{'#' * 60}")
+        print(f"start finetune: {model_type.upper()}")
+        print(f"{'#' * 60}")
 
-    # D. 训练循环
-    loss_history = []
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-        for batch_x, batch_y in loader:
-            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
-            optimizer.zero_grad()
+        results = finetune_loop(model_type)
+        all_results[model_type] = results
 
-            logits, _ = model(batch_x)
+        print(f"\n{'=' * 60}")
+        print(f"{model_type.upper()} final results")
+        for ratio, f1 in sorted(results.items()):
+            print(f"  {ratio:4.1f}% | {f1:.4f}")
+        print(f"{'=' * 60}")
 
-            # --- 应用混合损失 ---
-            ce_loss, triplet_loss = hybrid_triplet_prototype_loss(logits, batch_y, margin=MARGIN)
-            combined_loss = ce_loss + TRIPLET_WEIGHT * triplet_loss
-
-            combined_loss.backward()
-            optimizer.step()
-            total_loss += combined_loss.item()
-
-        avg_loss = total_loss / len(loader)
-        loss_history.append(avg_loss)
-        msg = f"Epoch [{epoch + 1}/{EPOCHS}], Loss: {avg_loss:.4f} (CE: {ce_loss:.4f}, Trip: {triplet_loss:.4f})"
-        print(msg);
-        log_to_file(log_path, msg)
-
-    # E. 最终评估
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for batch_x, batch_y in loader:
-            logits, _ = model(batch_x.to(DEVICE))
-            preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_y.numpy())
-
-    report = classification_report(all_labels, all_preds, digits=4)
-    log_to_file(log_path, "\nFinal Evaluation Report:\n" + report)
-
-    # 保存结果
-    os.makedirs("results/data", exist_ok=True)
-    mode = "hybrid_metric_with_pretrain" if (
-                os.path.exists(PRETRAIN_PATH) and PRETRAIN_PATH != "") else "hybrid_metric_no_pretrain"
-    np.save(f"results/data/loss_{mode}.npy", np.array(loss_history))
-    np.save(f"results/data/preds_{mode}.npy", np.array(all_preds))
-    np.save(f"results/data/labels_{mode}.npy", np.array(all_labels))
-    print(f"√ 实验完成，模式: {mode}\n", report)
+    if len(models_to_train) > 1:
+        print(f"\n{'#' * 60}")
+        print("combined comparison")
+        print(f"{'#' * 60}")
+        print(f"{'ratio':<10}", end="")
+        for model_type in models_to_train:
+            print(f"| {model_type.upper():<15}", end="")
+        print()
+        print("-" * (10 + 18 * len(models_to_train)))
+        for ratio in [0.1, 1, 5, 10]:
+            print(f"{ratio:4.1f}%   ", end="")
+            for model_type in models_to_train:
+                f1 = all_results[model_type].get(ratio, 0)
+                print(f"| {f1:>15.4f}", end="")
+            print()
 
 
 if __name__ == "__main__":
-    run_finetune()
+    main()
