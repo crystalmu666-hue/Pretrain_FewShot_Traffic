@@ -299,7 +299,7 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     parser.add_argument("--data-dir", default="data/processed")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--output-dir", default="results/confusion")
+    parser.add_argument("--output-dir", default="results/confusion2")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)

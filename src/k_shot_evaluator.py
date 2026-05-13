@@ -181,7 +181,7 @@ class EpisodicKShotEvaluator:
 def run_k_shot_evaluation(
     ratios=(0.1, 1, 5, 10),
     seeds=(42, 52, 62),
-    model_types=("none", "mae", "transformer"),
+    model_types=("none", "mae"),
     k_values=(1, 2, 5, 10),
     episodes=100,
     q_queries=20,
@@ -253,7 +253,7 @@ def main():
     parser = argparse.ArgumentParser(description="Episodic k-shot evaluation on an independent test set")
     parser.add_argument("--ratios", nargs="+", type=float, default=[0.1, 1, 5, 10])
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 52, 62])
-    parser.add_argument("--models", nargs="+", default=["none", "mae", "transformer"])
+    parser.add_argument("--models", nargs="+", default=["none", "mae"])
     parser.add_argument("--k_values", nargs="+", type=int, default=[1, 2, 5, 10])
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--q_queries", type=int, default=20)

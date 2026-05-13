@@ -9,6 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
+from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -31,6 +32,46 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.model(x), None
+
+
+class MAELinearHead(nn.Module):
+    def __init__(self, input_dim, num_classes=11):
+        super().__init__()
+        from models import MaskedTrafficAutoencoder
+
+        self.encoder = MaskedTrafficAutoencoder(
+            input_dim=input_dim,
+            mask_ratio=0.4,
+            hidden_dim=128,
+            latent_dim=32,
+        ).encoder
+        self.classifier = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.encoder(x)
+        logits = self.classifier(features)
+        return logits, features
+
+
+class AdapterMAELinearHead(nn.Module):
+    def __init__(self, input_dim, adapter_dim, num_classes=11):
+        super().__init__()
+        from models import MaskedTrafficAutoencoder
+
+        self.adapter = nn.Linear(input_dim, adapter_dim)
+        self.encoder = MaskedTrafficAutoencoder(
+            input_dim=adapter_dim,
+            mask_ratio=0.75,
+            hidden_dim=128,
+            latent_dim=32,
+        ).encoder
+        self.classifier = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        adapted = self.adapter(x)
+        features = self.encoder(adapted)
+        logits = self.classifier(features)
+        return logits, features
 
 
 class ComparisonExperiments:
@@ -61,6 +102,14 @@ class ComparisonExperiments:
         test_data = np.load("data/processed/test_set.npz")
         self.X_test, self.y_test = test_data["x"], test_data["y"]
         self.num_classes = len(np.unique(self.y_train_full))
+        self.source_dim = self._load_source_dim()
+
+    def _load_source_dim(self):
+        source_path = "data/processed/unsw_X.npy"
+        if not os.path.exists(source_path):
+            return self.X_train_full.shape[1]
+        source = np.load(source_path, mmap_mode="r")
+        return int(source.shape[1])
 
     def _analyze_rare_classes(self, report_dict):
         vals = []
@@ -72,11 +121,155 @@ class ComparisonExperiments:
     def _build_placeholder_history(self, macro_f1):
         return [{"epoch": 1, "loss": None, "macro_f1": float(macro_f1)}]
 
+    def _make_torch_loaders(self):
+        train_loader = DataLoader(
+            TensorDataset(
+                torch.FloatTensor(self.X_train_full),
+                torch.LongTensor(self.y_train_full),
+            ),
+            batch_size=64,
+            shuffle=True,
+        )
+        test_loader = DataLoader(
+            TensorDataset(
+                torch.FloatTensor(self.X_test),
+                torch.LongTensor(self.y_test),
+            ),
+            batch_size=256,
+            shuffle=False,
+        )
+        return train_loader, test_loader
+
+    def _evaluate_torch_model(self, model, test_loader):
+        model.eval()
+        preds, labels = [], []
+
+        with torch.no_grad():
+            for bx, by in test_loader:
+                bx = bx.to(DEVICE).float()
+                logits, _ = model(bx)
+                pred = torch.argmax(logits, dim=1).cpu().numpy()
+                preds.extend(pred.tolist())
+                labels.extend(by.numpy().tolist())
+
+        rep = classification_report(
+            labels,
+            preds,
+            output_dict=True,
+            digits=4,
+            zero_division=0,
+        )
+        macro_f1 = rep["macro avg"]["f1-score"]
+        acc = accuracy_score(labels, preds)
+        rare_recall = self._analyze_rare_classes(rep)
+        return macro_f1, acc, rare_recall
+
+    def _train_torch_model(self, model, train_loader, test_loader, epochs=None, lr=1e-3):
+        if epochs is None:
+            epochs = self.epochs
+
+        model = model.to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        history = []
+        best_macro_f1 = 0.0
+        best_state = None
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            total_loss = 0.0
+            batches = 0
+
+            for bx, by in train_loader:
+                bx = bx.to(DEVICE).float()
+                by = by.to(DEVICE).long()
+
+                optimizer.zero_grad()
+                logits, _ = model(bx)
+                loss = criterion(logits, by)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += float(loss.item())
+                batches += 1
+
+            macro_f1, _, _ = self._evaluate_torch_model(model, test_loader)
+            avg_loss = total_loss / max(batches, 1)
+            history.append(
+                {
+                    "epoch": int(epoch),
+                    "loss": float(avg_loss),
+                    "macro_f1": float(macro_f1),
+                }
+            )
+
+            if macro_f1 > best_macro_f1:
+                best_macro_f1 = macro_f1
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        macro_f1, acc, rare_recall = self._evaluate_torch_model(model, test_loader)
+        return {
+            "macro_f1": float(macro_f1),
+            "macro_f1_list": [float(macro_f1)],
+            "accuracy": float(acc),
+            "accuracy_list": [float(acc)],
+            "rare_recall": float(rare_recall),
+            "rare_recall_list": [float(rare_recall)],
+            "history_per_seed": [history],
+        }
+
     def _load_model_checkpoint(self, ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location=DEVICE)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            return checkpoint["model_state_dict"], checkpoint.get("history") or []
-        return checkpoint, []
+            return checkpoint["model_state_dict"], checkpoint.get("history") or [], checkpoint
+        return checkpoint, [], {}
+
+    def _load_mae_encoder_weights(self, model):
+        ckpt_path = "checkpoints/mae_pretrain.pth"
+        if not os.path.exists(ckpt_path):
+            print(f"MAE checkpoint not found: {ckpt_path}")
+            return 0
+
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        src_state = checkpoint.get("model_state_dict", checkpoint)
+        model_dict = model.state_dict()
+
+        matched = {}
+        for k, v in src_state.items():
+            candidates = [
+                k,
+                k.removeprefix("encoder."),
+                "encoder." + k,
+            ]
+
+            for ck in candidates:
+                if ck in model_dict and model_dict[ck].shape == v.shape:
+                    matched[ck] = v
+                    break
+
+        model.load_state_dict(matched, strict=False)
+        return len(matched)
+
+    def _infer_checkpoint_model_config(self, state_dict, checkpoint):
+        adapter_weight = state_dict.get("adapter.weight")
+        prototypes = state_dict.get("prototypes")
+
+        input_dim = self.X_train_full.shape[1]
+        adapter_dim = checkpoint.get("adapter_dim")
+        num_classes = self.num_classes
+
+        if adapter_weight is not None:
+            adapter_dim = int(adapter_weight.shape[0])
+            input_dim = int(adapter_weight.shape[1])
+
+        if prototypes is not None:
+            num_classes = int(prototypes.shape[0])
+
+        return input_dim, adapter_dim or input_dim, num_classes
 
     def _run_simple_dl_methods(self):
         from finetune import AdapterMetricNet
@@ -84,7 +277,6 @@ class ComparisonExperiments:
         methods = {
             "MetricNet": "none",
             "MetricNet_MAE": "mae",
-            "MetricNet_Transformer": "transformer",
         }
         results = {}
 
@@ -104,14 +296,15 @@ class ComparisonExperiments:
                 print(f"checkpoint not found: {ckpt_path}")
                 continue
 
-            model = AdapterMetricNet(
-                self.X_train_full.shape[1],
-                self.num_classes,
-                model_type=model_type,
-                adapter_dim=self.X_train_full.shape[1],
-            ).to(DEVICE)
+            state_dict, history, checkpoint = self._load_model_checkpoint(ckpt_path)
+            input_dim, adapter_dim, num_classes = self._infer_checkpoint_model_config(state_dict, checkpoint)
 
-            state_dict, history = self._load_model_checkpoint(ckpt_path)
+            model = AdapterMetricNet(
+                input_dim,
+                num_classes,
+                model_type=model_type,
+                adapter_dim=adapter_dim,
+            ).to(DEVICE)
             model.load_state_dict(state_dict)
             model.eval()
 
@@ -153,6 +346,98 @@ class ComparisonExperiments:
 
         return results
 
+    def _run_mlp_baseline(self):
+        train_loader, test_loader = self._make_torch_loaders()
+        model = SimpleMLP(
+            input_dim=self.X_train_full.shape[1],
+            num_classes=self.num_classes,
+        )
+        return {
+            "MLP": self._train_torch_model(
+                model,
+                train_loader,
+                test_loader,
+                epochs=self.epochs,
+                lr=1e-3,
+            )
+        }
+
+    def _run_mae_linear_baseline(self):
+        train_loader, test_loader = self._make_torch_loaders()
+        model = MAELinearHead(
+            input_dim=self.X_train_full.shape[1],
+            num_classes=self.num_classes,
+        )
+        loaded = self._load_mae_encoder_weights(model)
+        print(f"MAE + Linear loaded tensors: {loaded}")
+        return {
+            "MAE_Linear": self._train_torch_model(
+                model,
+                train_loader,
+                test_loader,
+                epochs=self.epochs,
+                lr=1e-3,
+            )
+        }
+
+    def _run_adapter_mae_linear_baseline(self):
+        train_loader, test_loader = self._make_torch_loaders()
+        model = AdapterMAELinearHead(
+            input_dim=self.X_train_full.shape[1],
+            adapter_dim=self.source_dim,
+            num_classes=self.num_classes,
+        )
+        loaded = self._load_mae_encoder_weights(model)
+        print(f"Adapter + MAE + Linear loaded tensors: {loaded}, adapter_dim={self.source_dim}")
+        return {
+            "Adapter_MAE_Linear": self._train_torch_model(
+                model,
+                train_loader,
+                test_loader,
+                epochs=self.epochs,
+                lr=1e-3,
+            )
+        }
+
+    def _run_protonet_baseline(self):
+        prototypes = []
+        labels_unique = list(range(self.num_classes))
+
+        for c in labels_unique:
+            idx = np.where(self.y_train_full == c)[0]
+            if len(idx) == 0:
+                prototypes.append(np.zeros(self.X_train_full.shape[1], dtype=np.float32))
+            else:
+                prototypes.append(self.X_train_full[idx].mean(axis=0))
+
+        prototypes = np.stack(prototypes, axis=0)
+        distances = np.linalg.norm(
+            self.X_test[:, None, :] - prototypes[None, :, :],
+            axis=2,
+        )
+        y_pred = np.argmin(distances, axis=1)
+        rep = classification_report(
+            self.y_test,
+            y_pred,
+            output_dict=True,
+            digits=4,
+            zero_division=0,
+        )
+        macro_f1 = rep["macro avg"]["f1-score"]
+        acc = accuracy_score(self.y_test, y_pred)
+        rare_recall = self._analyze_rare_classes(rep)
+        return {
+            "ProtoNet": {
+                "macro_f1": float(macro_f1),
+                "macro_f1_list": [float(macro_f1)],
+                "accuracy": float(acc),
+                "accuracy_list": [float(acc)],
+                "rare_recall": float(rare_recall),
+                "rare_recall_list": [float(rare_recall)],
+                "history_per_seed": [self._build_placeholder_history(macro_f1)],
+            }
+        }
+
     def _run_traditional_methods(self):
         methods = {
             "SVM": SVC(kernel="rbf", C=1.0),
@@ -179,8 +464,13 @@ class ComparisonExperiments:
     def run_all_experiments(self):
         results = {
             "traditional": self._run_traditional_methods(),
-            "simple_dl": self._run_simple_dl_methods(),
+            "simple_dl": {},
         }
+        results["simple_dl"].update(self._run_mlp_baseline())
+        results["simple_dl"].update(self._run_mae_linear_baseline())
+        results["simple_dl"].update(self._run_adapter_mae_linear_baseline())
+        results["simple_dl"].update(self._run_protonet_baseline())
+        results["simple_dl"].update(self._run_simple_dl_methods())
 
         mae = results["simple_dl"].get("MetricNet_MAE", {}).get("macro_f1", 0)
         base = results["simple_dl"].get("MetricNet", {}).get("macro_f1", 0)
@@ -211,11 +501,11 @@ def run_comparison_experiments():
 
         combined_result = {"traditional": {}, "simple_dl": {}, "pretrain_gain_list": []}
 
-        traditional_methods = ratio_results[0]["traditional"].keys()
+        traditional_methods = sorted({name for r in ratio_results for name in r["traditional"].keys()})
         for name in traditional_methods:
-            macro_f1_list = [r["traditional"][name]["macro_f1"] for r in ratio_results]
-            acc_list = [r["traditional"][name]["accuracy"] for r in ratio_results]
-            history_per_seed = [r["traditional"][name]["history_per_seed"][0] for r in ratio_results]
+            macro_f1_list = [r["traditional"][name]["macro_f1"] for r in ratio_results if name in r["traditional"]]
+            acc_list = [r["traditional"][name]["accuracy"] for r in ratio_results if name in r["traditional"]]
+            history_per_seed = [r["traditional"][name]["history_per_seed"][0] for r in ratio_results if name in r["traditional"]]
 
             combined_result["traditional"][name] = {
                 "macro_f1_list": macro_f1_list,
@@ -225,7 +515,7 @@ def run_comparison_experiments():
                 "history_per_seed": history_per_seed,
             }
 
-        dl_methods = ratio_results[0]["simple_dl"].keys()
+        dl_methods = sorted({name for r in ratio_results for name in r["simple_dl"].keys()})
         for name in dl_methods:
             macro_f1_list = []
             acc_list = []

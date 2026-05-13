@@ -8,8 +8,21 @@ import numpy as np
 with open("results/comparison/comparison_results.json", "r", encoding="utf-8") as f:
     results = json.load(f)
 
-save_dir = "results/figures"
+save_dir = "results/figures3"
 os.makedirs(save_dir, exist_ok=True)
+
+PREFERRED_ORDER = [
+    "SVM",
+    "KNN",
+    "RandomForest",
+    "MLP",
+    "MAE_Linear",
+    "Adapter_MAE_Linear",
+    "ProtoNet",
+    "MetricNet",
+    "MetricNet_MAE",
+]
+TRAINABLE_CURVE_METHODS = {"MLP", "MAE_Linear", "Adapter_MAE_Linear", "MetricNet", "MetricNet_MAE"}
 
 
 def mean_std(values):
@@ -57,12 +70,22 @@ def average_history(histories):
 plt.figure(figsize=(8, 6))
 ratios = sorted(results.keys(), key=lambda x: float(x))
 
+all_methods = {}
 for method in results[ratios[0]]["simple_dl"].keys():
+    all_methods[method] = "simple_dl"
+for method in results[ratios[0]]["traditional"].keys():
+    all_methods[method] = "traditional"
+
+ordered_methods = [m for m in PREFERRED_ORDER if m in all_methods]
+ordered_methods.extend([m for m in all_methods if m not in ordered_methods])
+
+for method in ordered_methods:
+    group = all_methods[method]
     means = []
     stds = []
 
     for r in ratios:
-        data = results[r]["simple_dl"][method]
+        data = results[r][group][method]
         m, s = mean_std(data["macro_f1_list"])
         means.append(m)
         stds.append(s)
@@ -83,13 +106,17 @@ for r in ratios:
     methods = []
     scores = []
 
-    for name, data in results[r]["simple_dl"].items():
-        methods.append(name)
-        scores.append(data["macro_f1"])
-
+    method_data = {}
     for name, data in results[r]["traditional"].items():
+        method_data[name] = data["macro_f1"]
+    for name, data in results[r]["simple_dl"].items():
+        method_data[name] = data["macro_f1"]
+
+    ordered = [m for m in PREFERRED_ORDER if m in method_data]
+    ordered.extend([m for m in method_data if m not in ordered])
+    for name in ordered:
         methods.append(name)
-        scores.append(data["macro_f1"])
+        scores.append(method_data[name])
 
     x = np.arange(len(methods))
     plt.bar(x, scores)
@@ -110,6 +137,8 @@ for r in ratios:
     has_curve = False
 
     for name, data in results[r]["simple_dl"].items():
+        if name not in TRAINABLE_CURVE_METHODS:
+            continue
         if "history_per_seed" not in data:
             continue
 
@@ -144,6 +173,8 @@ for r in ratios:
     has_curve = False
 
     for name, data in results[r]["simple_dl"].items():
+        if name not in TRAINABLE_CURVE_METHODS:
+            continue
         if "history_per_seed" not in data:
             continue
 

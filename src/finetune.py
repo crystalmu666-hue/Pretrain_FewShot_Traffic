@@ -22,14 +22,24 @@ from torch.utils.data import DataLoader, TensorDataset
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
 EPOCHS_FROZEN = 20
-EPOCHS_FINETUNE = 30
-LEARNING_RATE_ENCODER = 1e-5
+EPOCHS_FINETUNE = 50
+LEARNING_RATE_ENCODER = 5e-5
 LEARNING_RATE_TOP = 1e-3
 LEARNING_RATE_ADAPTER = 1e-3
 
-MARGIN = 1.0
-TRIPLET_WEIGHT = 0.1
-MMD_WEIGHT = 0.1
+BASE_MARGIN = 1.0
+FIXED_MARGIN = 1.0
+SCARCITY_GAMMA = 0.2
+ADAPTIVE_MARGIN_MIN = 1.0
+ADAPTIVE_MARGIN_MAX = 2.0
+PROTOTYPE_MARGIN_WEIGHT = 0.03
+CSA_PM_MAX_RATIO = 0.1
+ALIGNMENT_BASE_WEIGHT = 0.05
+ALIGNMENT_REFERENCE_RATIO = 5.0
+ALIGNMENT_MIN_SCALE = 0.5
+ALIGNMENT_MAX_SCALE = 2.0
+SOURCE_BATCH_SIZE = 256
+MMD_KERNEL_MULTIPLIERS = (0.5, 1.0, 2.0, 4.0)
 
 DATA_DIR = "data/processed"
 TEST_SET = os.path.join(DATA_DIR, "test_set.npz")
@@ -37,7 +47,6 @@ SOURCE_DATA_PATH = os.path.join(DATA_DIR, "unsw_X.npy")
 
 PRETRAIN_MODELS = {
     "mae": "checkpoints/mae_pretrain.pth",
-    "transformer": "checkpoints/transformer_pretrain.pth",
 }
 
 
@@ -102,12 +111,7 @@ class AdapterMetricNet(nn.Module):
                 latent_dim=32,
             ).encoder
             self.latent_dim = 32
-        elif model_type == "transformer":
-            from models import TrafficTransformer
-
-            self.encoder = TrafficTransformer(adapter_dim, hidden_dim=64, projection_dim=32)
-            self.latent_dim = 32
-        else:
+        elif model_type == "none":
             self.encoder = nn.Sequential(
                 nn.Linear(adapter_dim, 256),
                 nn.ReLU(),
@@ -116,10 +120,12 @@ class AdapterMetricNet(nn.Module):
                 nn.Linear(128, 64),
             )
             self.latent_dim = 64
+        else:
+            raise ValueError(f"unsupported model_type: {model_type}")
 
         self.prototypes = nn.Parameter(torch.randn(num_classes, self.latent_dim))
 
-    def forward(self, x, return_features=False):
+    def adapt_target(self, x):
         current_input_dim = x.shape[-1]
 
         if self.use_adapter:
@@ -130,10 +136,18 @@ class AdapterMetricNet(nn.Module):
         elif current_input_dim != self.adapter_dim:
             x = x[:, : self.adapter_dim]
 
-        if self.model_type == "transformer":
-            _, projections = self.encoder(x)
-        else:
-            projections = self.encoder(x)
+        return x
+
+    def encode_target(self, x):
+        return self.encoder(self.adapt_target(x))
+
+    def encode_source(self, x):
+        if x.shape[-1] == self.adapter_dim:
+            return self.encoder(x)
+        return self.encode_target(x)
+
+    def forward(self, x, return_features=False):
+        projections = self.encode_target(x)
 
         features_exp = projections.unsqueeze(1)
         prototypes_exp = self.prototypes.unsqueeze(0)
@@ -145,25 +159,174 @@ class AdapterMetricNet(nn.Module):
         return logits, projections
 
 
-def hybrid_triplet_prototype_loss(logits, targets, margin=1.0, class_weights=None):
-    if class_weights is not None:
-        ce_loss = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))(logits, targets)
-    else:
-        ce_loss = nn.CrossEntropyLoss()(logits, targets)
+def prototype_margin_loss(features, prototypes, targets, margins):
+    distances = torch.cdist(features, prototypes)
+    batch_range = torch.arange(distances.size(0), device=distances.device)
+    positive_dist = distances[batch_range, targets]
 
-    batch_range = torch.arange(logits.size(0)).to(DEVICE)
-    pos_dist = -logits[batch_range, targets]
-    mask = torch.ones_like(logits).scatter_(1, targets.unsqueeze(1), 0.0)
-    nearest_neg_logits, _ = torch.max(logits * mask - (1 - mask) * 1e9, dim=1)
-    nearest_neg_dist = -nearest_neg_logits
-    triplet_loss = torch.clamp(pos_dist - nearest_neg_dist + margin, min=0.0).mean()
-    return ce_loss, triplet_loss
+    negative_distances = distances.clone()
+    negative_distances[batch_range, targets] = float("inf")
+    nearest_negative_dist = negative_distances.min(dim=1).values
+
+    sample_margins = margins.to(DEVICE)[targets]
+    return torch.clamp(positive_dist - nearest_negative_dist + sample_margins, min=0.0).mean()
+
+
+def select_loss_policy(ratio):
+    if ratio <= CSA_PM_MAX_RATIO:
+        return {
+            "name": "cew_csa_pm",
+            "display_name": "CE^w + CSA-PM",
+            "use_class_weights": True,
+            "margin_type": "csa",
+        }
+    return {
+        "name": "ce_fixed_pm",
+        "display_name": "CE + Fixed PM",
+        "use_class_weights": False,
+        "margin_type": "fixed",
+    }
+
+
+def compute_policy_loss(
+    logits,
+    features,
+    prototypes,
+    targets,
+    policy,
+    class_weights,
+    fixed_margins,
+    adaptive_margins,
+):
+    ce_weight = class_weights.to(DEVICE) if policy["use_class_weights"] else None
+    ce_loss = nn.CrossEntropyLoss(weight=ce_weight)(logits, targets)
+
+    if policy["margin_type"] == "csa":
+        pm_loss = prototype_margin_loss(features, prototypes, targets, adaptive_margins)
+    elif policy["margin_type"] == "fixed":
+        pm_loss = prototype_margin_loss(features, prototypes, targets, fixed_margins)
+    else:
+        raise ValueError(f"unsupported margin type: {policy['margin_type']}")
+
+    loss = ce_loss + PROTOTYPE_MARGIN_WEIGHT * pm_loss
+    return loss, ce_loss, pm_loss
+
+
+def make_source_loader(source_X):
+    dataset = TensorDataset(torch.FloatTensor(source_X.astype(np.float32)))
+    return DataLoader(dataset, batch_size=SOURCE_BATCH_SIZE, shuffle=True, drop_last=True)
+
+
+def next_source_batch(source_iter, source_loader):
+    try:
+        (source_x,) = next(source_iter)
+    except StopIteration:
+        source_iter = iter(source_loader)
+        (source_x,) = next(source_iter)
+    return source_x, source_iter
+
+
+def covariance(features):
+    centered = features - features.mean(dim=0, keepdim=True)
+    denom = max(features.size(0) - 1, 1)
+    return centered.T.matmul(centered) / denom
+
+
+def coral_loss(source_features, target_features):
+    source_cov = covariance(source_features)
+    target_cov = covariance(target_features)
+    dim = source_features.size(1)
+    return (source_cov - target_cov).pow(2).sum() / (4.0 * dim * dim)
+
+
+def mmd_loss(source_features, target_features, kernel_multipliers=MMD_KERNEL_MULTIPLIERS):
+    combined = torch.cat([source_features, target_features], dim=0)
+    pairwise_sq_dist = torch.cdist(combined, combined).pow(2)
+
+    with torch.no_grad():
+        positive_dist = pairwise_sq_dist[pairwise_sq_dist > 0]
+        base_bandwidth = positive_dist.median() if positive_dist.numel() else torch.tensor(1.0, device=combined.device)
+        base_bandwidth = torch.clamp(base_bandwidth, min=1e-6)
+
+    kernels = 0.0
+    for multiplier in kernel_multipliers:
+        bandwidth = base_bandwidth * multiplier
+        kernels = kernels + torch.exp(-pairwise_sq_dist / bandwidth)
+
+    n_source = source_features.size(0)
+    source_kernel = kernels[:n_source, :n_source]
+    target_kernel = kernels[n_source:, n_source:]
+    cross_kernel = kernels[:n_source, n_source:]
+    return source_kernel.mean() + target_kernel.mean() - 2.0 * cross_kernel.mean()
+
+
+def compute_alignment_loss(source_features, target_features, alignment):
+    if alignment == "none":
+        return target_features.new_tensor(0.0)
+    if alignment == "coral":
+        return coral_loss(source_features, target_features)
+    if alignment == "mmd":
+        return mmd_loss(source_features, target_features)
+    if alignment == "coral_mmd":
+        return coral_loss(source_features, target_features) + mmd_loss(source_features, target_features)
+    raise ValueError(f"unsupported alignment: {alignment}")
+
+
+def compute_adaptive_alignment_weight(ratio, base_weight=ALIGNMENT_BASE_WEIGHT):
+    safe_ratio = max(float(ratio), 1e-6)
+    raw_scale = np.sqrt(ALIGNMENT_REFERENCE_RATIO / safe_ratio)
+    scale = float(np.clip(raw_scale, ALIGNMENT_MIN_SCALE, ALIGNMENT_MAX_SCALE))
+    effective_weight = float(base_weight * scale)
+    return effective_weight, {
+        "base_weight": float(base_weight),
+        "effective_weight": effective_weight,
+        "target_ratio": float(ratio),
+        "reference_ratio": float(ALIGNMENT_REFERENCE_RATIO),
+        "raw_scale": float(raw_scale),
+        "scale": scale,
+        "min_scale": float(ALIGNMENT_MIN_SCALE),
+        "max_scale": float(ALIGNMENT_MAX_SCALE),
+    }
 
 
 def compute_class_weights(y, num_classes):
     class_counts = np.bincount(y, minlength=num_classes)
     total_samples = len(y)
     return torch.FloatTensor(total_samples / (num_classes * (class_counts + 1e-10)))
+
+
+def compute_adaptive_margins(
+    y,
+    num_classes,
+    base_margin=BASE_MARGIN,
+    gamma=SCARCITY_GAMMA,
+    margin_min=ADAPTIVE_MARGIN_MIN,
+    margin_max=ADAPTIVE_MARGIN_MAX,
+):
+    class_counts = np.bincount(y, minlength=num_classes).astype(np.float32)
+    total_samples = float(len(y))
+    safe_counts = np.maximum(class_counts, 1.0)
+
+    scarcity = total_samples / (num_classes * safe_counts)
+    normalized_scarcity = scarcity / np.mean(scarcity)
+    raw_margins = base_margin * (1.0 + gamma * normalized_scarcity)
+    margins = np.clip(raw_margins, margin_min, margin_max)
+
+    return (
+        torch.FloatTensor(margins),
+        {
+            "class_counts": class_counts.astype(int).tolist(),
+            "scarcity": scarcity.tolist(),
+            "normalized_scarcity": normalized_scarcity.tolist(),
+            "raw_adaptive_margins": raw_margins.tolist(),
+            "adaptive_margins": margins.tolist(),
+            "base_margin": float(base_margin),
+            "gamma": float(gamma),
+            "margin_min": float(margin_min),
+            "margin_max": float(margin_max),
+            "prototype_margin_weighted": False,
+        },
+    )
 
 
 def load_fewshot_npz(ratio, seed):
@@ -179,9 +342,29 @@ def load_test_set():
     return data["x"], data["y"]
 
 
-def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
+def finetune_loop(
+    model_type,
+    ratios=[0.1, 1, 5, 10],
+    seeds=[42, 52, 62],
+    alignment="mmd",
+    lambda_align_base=ALIGNMENT_BASE_WEIGHT,
+):
     test_X, test_y = load_test_set()
     ratio_results = {}
+    source_X = None
+    source_dim = None
+    source_loader = None
+    use_source_alignment = model_type == "mae" and alignment != "none"
+
+    if use_source_alignment:
+        if not os.path.exists(SOURCE_DATA_PATH):
+            print(f"source data not found, disable alignment: {SOURCE_DATA_PATH}")
+            use_source_alignment = False
+        else:
+            source_X = np.load(SOURCE_DATA_PATH).astype(np.float32)
+            source_dim = int(source_X.shape[1])
+            source_loader = make_source_loader(source_X)
+            print(f"source alignment enabled: {alignment}, source_dim={source_dim}")
 
     for ratio in ratios:
         print(f"\n{'=' * 60}")
@@ -195,6 +378,7 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
             X_train, y_train = load_fewshot_npz(ratio, seed)
             input_dim = X_train.shape[1]
             num_classes = len(np.unique(y_train))
+            adapter_dim = source_dim if use_source_alignment and source_dim is not None else input_dim
 
             train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
             train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -205,7 +389,7 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
                 input_dim=input_dim,
                 num_classes=num_classes,
                 model_type=model_type,
-                adapter_dim=input_dim,
+                adapter_dim=adapter_dim,
             ).to(DEVICE)
 
             load_pretrained_weights_into_model(model, model_type)
@@ -223,6 +407,36 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
             )
 
             class_weights = compute_class_weights(y_train, num_classes)
+            class_margins, margin_info = compute_adaptive_margins(y_train, num_classes)
+            fixed_margins = torch.full((num_classes,), FIXED_MARGIN, dtype=torch.float32)
+            loss_policy = select_loss_policy(ratio)
+            effective_alignment = alignment if use_source_alignment else "none"
+            lambda_align, lambda_align_info = compute_adaptive_alignment_weight(ratio, lambda_align_base)
+            if effective_alignment == "none":
+                lambda_align = 0.0
+                lambda_align_info["effective_weight"] = 0.0
+            print(
+                f"  loss policy: {loss_policy['display_name']} | "
+                f"pm_weight={PROTOTYPE_MARGIN_WEIGHT}"
+            )
+            if loss_policy["margin_type"] == "csa":
+                print(
+                    "  CSA-PM margins: "
+                    f"min={class_margins.min().item():.4f}, "
+                    f"max={class_margins.max().item():.4f}, "
+                    f"gamma={SCARCITY_GAMMA}"
+                )
+            else:
+                print(f"  fixed PM margin: {FIXED_MARGIN:.4f}")
+            print(
+                f"  class-weighted CE: {loss_policy['use_class_weights']} | "
+                f"threshold for CSA-PM: <= {CSA_PM_MAX_RATIO}%"
+            )
+            print(
+                f"  alignment: {effective_alignment} | "
+                f"lambda_align={lambda_align:.4f} | "
+                f"adapter_dim={adapter_dim}"
+            )
             best_f1 = 0.0
             best_epoch = 0
             best_state_dict = None
@@ -231,24 +445,42 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
             for epoch in range(EPOCHS_FINETUNE):
                 model.train()
                 total_loss = 0.0
+                total_ce_loss = 0.0
+                total_pm_loss = 0.0
+                total_align_loss = 0.0
                 batch_count = 0
+                source_iter = iter(source_loader) if effective_alignment != "none" else None
 
                 for batch_x, batch_y in train_loader:
                     batch_x = batch_x.to(DEVICE)
                     batch_y = batch_y.to(DEVICE)
 
                     optimizer.zero_grad()
-                    logits, _ = model(batch_x)
-                    ce_loss, triplet_loss = hybrid_triplet_prototype_loss(
+                    logits, features = model(batch_x)
+                    loss, ce_loss, pm_loss = compute_policy_loss(
                         logits,
+                        features,
+                        model.prototypes,
                         batch_y,
-                        class_weights=class_weights,
+                        loss_policy,
+                        class_weights,
+                        fixed_margins,
+                        class_margins,
                     )
-                    loss = ce_loss + TRIPLET_WEIGHT * triplet_loss
+                    align_loss = features.new_tensor(0.0)
+                    if effective_alignment != "none":
+                        source_x, source_iter = next_source_batch(source_iter, source_loader)
+                        source_features = model.encode_source(source_x.to(DEVICE))
+                        align_loss = compute_alignment_loss(source_features, features, effective_alignment)
+
+                    loss = loss + lambda_align * align_loss
                     loss.backward()
                     optimizer.step()
 
                     total_loss += loss.item()
+                    total_ce_loss += ce_loss.item()
+                    total_pm_loss += pm_loss.item()
+                    total_align_loss += align_loss.item()
                     batch_count += 1
 
                 model.eval()
@@ -262,7 +494,16 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
                 report = classification_report(labels, preds, output_dict=True, zero_division=0)
                 f1 = float(report["macro avg"]["f1-score"])
                 avg_loss = float(total_loss / max(batch_count, 1))
-                epoch_history.append({"epoch": epoch + 1, "loss": avg_loss, "macro_f1": f1})
+                epoch_history.append(
+                    {
+                        "epoch": epoch + 1,
+                        "loss": avg_loss,
+                        "ce_loss": float(total_ce_loss / max(batch_count, 1)),
+                        "prototype_margin_loss": float(total_pm_loss / max(batch_count, 1)),
+                        "alignment_loss": float(total_align_loss / max(batch_count, 1)),
+                        "macro_f1": f1,
+                    }
+                )
 
                 if f1 > best_f1:
                     best_f1 = f1
@@ -283,6 +524,18 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
                     "ratio": ratio,
                     "seed": seed,
                     "model_type": model_type,
+                    "loss": loss_policy["name"],
+                    "loss_policy": loss_policy,
+                    "prototype_margin_weight": float(PROTOTYPE_MARGIN_WEIGHT),
+                    "fixed_margin": float(FIXED_MARGIN),
+                    "csa_pm_max_ratio": float(CSA_PM_MAX_RATIO),
+                    "margin_info": margin_info if loss_policy["margin_type"] == "csa" else None,
+                    "alignment": effective_alignment,
+                    "alignment_weight": float(lambda_align),
+                    "alignment_weight_info": lambda_align_info,
+                    "source_data": SOURCE_DATA_PATH if use_source_alignment else None,
+                    "source_dim": source_dim,
+                    "adapter_dim": int(adapter_dim),
                 },
                 f"checkpoints/finetune_{model_type}_ratio{int(ratio)}_seed{seed}.pth",
             )
@@ -296,18 +549,31 @@ def finetune_loop(model_type, ratios=[0.1, 1, 5, 10], seeds=[42, 52, 62]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Finetune script with MAE/Transformer support")
+    parser = argparse.ArgumentParser(description="Finetune AdapterMetricNet with MAE pretraining")
     parser.add_argument(
         "--model",
         type=str,
         default="all",
-        choices=["none", "mae", "transformer", "all"],
+        choices=["none", "mae", "all"],
         help="pretrain backbone type",
+    )
+    parser.add_argument(
+        "--alignment",
+        type=str,
+        default="mmd",
+        choices=["none", "coral", "mmd", "coral_mmd"],
+        help="source-target feature alignment loss used for MAE fine-tuning",
+    )
+    parser.add_argument(
+        "--lambda-align-base",
+        type=float,
+        default=ALIGNMENT_BASE_WEIGHT,
+        help="base alignment weight at the reference labeled ratio",
     )
     args = parser.parse_args()
 
     if args.model == "all":
-        models_to_train = ["mae", "transformer", "none"]
+        models_to_train = ["mae", "none"]
     else:
         models_to_train = [args.model]
 
@@ -317,7 +583,11 @@ def main():
         print(f"start finetune: {model_type.upper()}")
         print(f"{'#' * 60}")
 
-        results = finetune_loop(model_type)
+        results = finetune_loop(
+            model_type,
+            alignment=args.alignment,
+            lambda_align_base=args.lambda_align_base,
+        )
         all_results[model_type] = results
 
         print(f"\n{'=' * 60}")
