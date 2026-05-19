@@ -1,56 +1,111 @@
 """
-Generate paper-ready figures and tables for the MAE + AdapterMetricNet study.
+Generate paper-ready tables and figures for the final IR-SCB-Focal results.
 
-Expected inputs:
-  - results/k_shot/episodic/k_shot_results.json
-  - results/ablation/ablation_results_all.json
-  - results/cross_domain/cross_domain_results.json
-  - results/cross_domain/cross_domain_results_0p1.json (optional)
+The script focuses on the figures that directly support the paper claims:
+  - main result tables for Macro-F1 / Balanced Accuracy / Rare Recall
+  - grouped Macro-F1 bar charts for in-domain and cross-domain experiments
+  - Macro-F1 gain over the strongest baseline
+  - rho adaptation mechanism plot
+  - Focal-family ablation bar chart for representative scenarios
+  - optional seed-level stability point chart
 """
 
+import argparse
 import csv
 import json
 import os
 from collections import defaultdict
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 
+from finetune_methods import ABLATION_METHODS, MAIN_METHODS, METHOD_LABELS
+
+
+RESULT_DIR = "results/ir_scb_focal_rhomin0_full"
+OUTPUT_DIR = "results/paper_figures/ir_scb_focal_final"
+
+MAIN_ORDER = ["ce", "wce", "focal", "balanced_softmax", "ir_scb_focal"]
+ABLATION_ORDER = ["focal", "cb_focal", "scb_focal_rho025", "scb_focal_rho05", "ir_scb_focal"]
+
+COLORS = {
+    "ce": "#77c5ff",
+    "wce": "#24d9ff",
+    "focal": "#ffd354",
+    "balanced_softmax": "#5df6c1",
+    "cb_focal": "#ffab51",
+    "scb_focal_rho025": "#ff8061",
+    "scb_focal_rho05": "#ff557b",
+    "ir_scb_focal": "#ff329b",
+}
+
+METRICS = [
+    ("macro_f1", "Macro-F1"),
+    ("balanced_accuracy", "Balanced Accuracy"),
+    ("rare_recall", "Rare Recall"),
+]
 
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial"]
 plt.rcParams["axes.unicode_minus"] = False
 plt.rcParams["figure.dpi"] = 120
 
 
-class PaperFigures:
-    def __init__(self, output_dir="results/paper_figures"):
+class PaperFigureBuilder:
+    def __init__(self, result_dir=RESULT_DIR, output_dir=OUTPUT_DIR):
+        self.result_dir = result_dir
         self.output_dir = output_dir
-        self.figure_dir = os.path.join(output_dir, "figures2")
+        self.figure_dir = os.path.join(output_dir, "figures")
         self.table_dir = os.path.join(output_dir, "tables")
         os.makedirs(self.figure_dir, exist_ok=True)
         os.makedirs(self.table_dir, exist_ok=True)
 
     def generate_all(self):
-        self._generate_k_shot_curve()
-        self._generate_k_shot_gain_heatmap()
-        self._generate_ablation_core_bar()
-        self._generate_ablation_tables()
-        self._generate_cross_domain_figures()
-        self._generate_cross_domain_table()
-        print(f"figures saved to: {self.figure_dir}")
-        print(f"tables saved to:  {self.table_dir}")
+        self._clean_output_dirs()
 
-    @staticmethod
-    def _load_json(path):
+        main_data = {
+            "indomain": self._load_required("indomain_main_results.json"),
+            "crossdomain": self._load_required("crossdomain_main_results.json"),
+        }
+        ablation_data = {
+            "indomain": self._load_required("indomain_ablation_results.json"),
+            "crossdomain": self._load_required("crossdomain_ablation_results.json"),
+        }
+
+        for domain, data in main_data.items():
+            self._ensure_summary(data)
+            self._save_main_metric_tables(domain, data)
+            self._plot_grouped_macro_f1(domain, data)
+
+        self._save_gain_table_and_plot(main_data)
+        self._plot_rho_mechanism(main_data["crossdomain"])
+
+        for data in ablation_data.values():
+            self._ensure_summary(data)
+        self._save_ablation_tables(ablation_data)
+        self._plot_ablation_heatmaps(ablation_data)
+        self._plot_key_ablation_bars(ablation_data)
+        self._plot_seed_stability(main_data)
+
+        print(f"paper figures saved to: {self.figure_dir}")
+        print(f"paper tables saved to:  {self.table_dir}")
+
+    def _clean_output_dirs(self):
+        for directory in [self.figure_dir, self.table_dir]:
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+
+    def _load_required(self, filename):
+        path = os.path.join(self.result_dir, filename)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"result file not found: {path}")
+            raise FileNotFoundError(f"missing result file: {path}")
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-
-    @staticmethod
-    def _mean_std(values):
-        arr = np.asarray(values, dtype=np.float64)
-        return float(arr.mean()), float(arr.std(ddof=0))
 
     def _save_csv(self, filename, rows, fieldnames):
         path = os.path.join(self.table_dir, filename)
@@ -59,362 +114,427 @@ class PaperFigures:
             writer.writeheader()
             writer.writerows(rows)
         print(f"saved table: {path}")
-        return path
 
-    def _load_k_shot_summary(self):
-        data = self._load_json("results/k_shot/episodic/k_shot_results.json")
-        rows = []
+    def _save_md(self, filename, rows, headers):
+        path = os.path.join(self.table_dir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("| " + " | ".join(headers) + " |\n")
+            f.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+            for row in rows:
+                f.write("| " + " | ".join(str(row.get(h, "")) for h in headers) + " |\n")
+        print(f"saved table: {path}")
 
-        for ratio, ratio_data in data["results"].items():
-            grouped = defaultdict(list)
-            ci_values = defaultdict(list)
+    def _save_fig(self, fig, filename):
+        path = os.path.join(self.figure_dir, filename)
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"saved figure: {path}")
 
+    @staticmethod
+    def _ratio_label(ratio):
+        return f"{float(ratio):g}%"
+
+    @staticmethod
+    def _ratio_key(ratio):
+        return str(float(ratio))
+
+    @staticmethod
+    def _fmt(mean, std):
+        return f"{mean:.4f} +/- {std:.4f}"
+
+    @staticmethod
+    def _mean_std(values):
+        values = np.asarray(values, dtype=np.float64)
+        if values.size == 0:
+            return 0.0, 0.0
+        return float(values.mean()), float(values.std(ddof=0))
+
+    def _ratios(self, data):
+        return sorted(data["summary"].keys(), key=lambda item: float(item))
+
+    def _runs(self, data):
+        runs = []
+        for ratio_data in data.get("results", {}).values():
             for seed_data in ratio_data.values():
-                for model_type, model_data in seed_data.items():
-                    if model_type not in {"none", "mae"}:
-                        continue
-                    for k, metrics in model_data["k"].items():
-                        key = (float(ratio), model_type, int(k))
-                        grouped[key].append(metrics["macro_f1"]["mean"])
-                        ci_values[key].append(metrics["macro_f1"].get("ci95", 0.0))
+                runs.extend(seed_data.get("runs", []))
+        return runs
 
-            for (ratio_value, model_type, k), values in grouped.items():
-                mean, std = self._mean_std(values)
-                rows.append(
-                    {
-                        "ratio": ratio_value,
-                        "model_type": model_type,
-                        "k": k,
-                        "macro_f1_mean": mean,
-                        "macro_f1_std_across_seeds": std,
-                        "mean_episode_ci95": float(np.mean(ci_values[(ratio_value, model_type, k)])),
-                        "seeds": len(values),
-                    }
-                )
+    def _ensure_summary(self, data):
+        runs = self._runs(data)
+        if not runs:
+            return
 
-        rows.sort(key=lambda r: (r["ratio"], r["model_type"], r["k"]))
-        return rows
+        grouped = defaultdict(list)
+        for run in runs:
+            grouped[(str(run["ratio"]), run["method"])].append(run)
 
-    def _generate_k_shot_curve(self):
-        rows = self._load_k_shot_summary()
-        self._save_csv(
-            "k_shot_summary.csv",
-            rows,
-            [
-                "ratio",
-                "model_type",
-                "k",
-                "macro_f1_mean",
-                "macro_f1_std_across_seeds",
-                "mean_episode_ci95",
-                "seeds",
-            ],
-        )
-
-        ratios = sorted({row["ratio"] for row in rows})
-        models = ["none", "mae"]
-        colors = {"none": "#6b7280", "mae": "#d62728"}
-        labels = {"none": "No pretrain", "mae": "MAE"}
-
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharey=True)
-        axes = axes.flatten()
-
-        for ax, ratio in zip(axes, ratios):
-            for model in models:
-                model_rows = [r for r in rows if r["ratio"] == ratio and r["model_type"] == model]
-                if not model_rows:
-                    continue
-                model_rows.sort(key=lambda r: r["k"])
-                x = [r["k"] for r in model_rows]
-                y = [r["macro_f1_mean"] for r in model_rows]
-                err = [r["macro_f1_std_across_seeds"] for r in model_rows]
-                ax.errorbar(x, y, yerr=err, marker="o", linewidth=2, capsize=3, color=colors[model], label=labels[model])
-
-            ax.set_title(f"{ratio:g}% labeled target data")
-            ax.set_xlabel("K shots")
-            ax.set_xticks([1, 2, 5, 10])
-            ax.grid(True, axis="y", linestyle="--", alpha=0.4)
-
-        axes[0].set_ylabel("Episodic Macro-F1")
-        axes[2].set_ylabel("Episodic Macro-F1")
-        axes[0].legend(frameon=False, loc="lower right")
-        fig.suptitle("K-shot episodic evaluation on CICIDS", y=0.98)
-        fig.tight_layout()
-
-        path = os.path.join(self.figure_dir, "k_shot_macro_f1_curves.png")
-        fig.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"saved figure: {path}")
-
-    def _generate_k_shot_gain_heatmap(self):
-        rows = self._load_k_shot_summary()
-        ratios = sorted({row["ratio"] for row in rows})
-        ks = sorted({row["k"] for row in rows})
-        value_map = {(r["ratio"], r["model_type"], r["k"]): r["macro_f1_mean"] for r in rows}
-
-        gains = np.zeros((len(ratios), len(ks)), dtype=np.float64)
-        table_rows = []
-        for i, ratio in enumerate(ratios):
-            for j, k in enumerate(ks):
-                gain = value_map[(ratio, "mae", k)] - value_map[(ratio, "none", k)]
-                gains[i, j] = gain
-                table_rows.append({"ratio": ratio, "k": k, "mae_minus_no_pretrain_macro_f1": gain})
-
-        self._save_csv("k_shot_mae_gain_heatmap_values.csv", table_rows, ["ratio", "k", "mae_minus_no_pretrain_macro_f1"])
-
-        fig, ax = plt.subplots(figsize=(7, 4.8))
-        im = ax.imshow(gains, cmap="RdYlGn", aspect="auto")
-        ax.set_xticks(range(len(ks)), [str(k) for k in ks])
-        ax.set_yticks(range(len(ratios)), [f"{ratio:g}%" for ratio in ratios])
-        ax.set_xlabel("K shots")
-        ax.set_ylabel("Labeled target ratio")
-        ax.set_title("MAE pretraining gain in episodic Macro-F1")
-
-        for i in range(len(ratios)):
-            for j in range(len(ks)):
-                ax.text(j, i, f"{gains[i, j]:+.3f}", ha="center", va="center", fontsize=10)
-
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label("MAE - no pretrain")
-        fig.tight_layout()
-
-        path = os.path.join(self.figure_dir, "k_shot_mae_gain_heatmap.png")
-        fig.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"saved figure: {path}")
-
-    def _load_ablation_summary(self):
-        data = self._load_json("results/ablation/ablation_results_all.json")
-        rows = []
-        display_names = {}
-
-        for ratio, ratio_data in data.items():
-            for variant in ratio_data["config"]["variants"]:
-                display_names[variant["name"]] = variant.get("display_name", variant["name"])
-
-            for key, values in ratio_data["summary"].items():
-                _, variant = key.split("::", 1)
-                rows.append(
-                    {
-                        "ratio": float(ratio),
-                        "variant": variant,
-                        "display_name": display_names.get(variant, variant),
-                        "mean_macro_f1": values["mean_macro_f1"],
-                        "std_macro_f1": values["std_macro_f1"],
-                        "runs": values["runs"],
-                    }
-                )
-
-        rows.sort(key=lambda r: (r["ratio"], r["variant"]))
-        return rows
-
-    def _generate_ablation_core_bar(self):
-        rows = self._load_ablation_summary()
-        self._save_csv(
-            "ablation_full_summary.csv",
-            rows,
-            ["ratio", "variant", "display_name", "mean_macro_f1", "std_macro_f1", "runs"],
-        )
-
-        ratios_to_show = sorted({r["ratio"] for r in rows})[:4]
-        variants = ["ce", "ce_fixed_pm", "cew_fixed_pm", "cew_csa_pm"]
-        labels = ["CE", "CE +\nFixed PM", "CE^w +\nFixed PM", "CE^w +\nCSA-PM"]
-        row_map = {(r["ratio"], r["variant"]): r for r in rows}
-
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharey=True)
-        axes = axes.flatten()
-        x = np.arange(len(variants))
-
-        for ax, ratio in zip(axes, ratios_to_show):
-            means = [row_map[(ratio, variant)]["mean_macro_f1"] for variant in variants]
-            stds = [row_map[(ratio, variant)]["std_macro_f1"] for variant in variants]
-            colors = ["#9ca3af", "#60a5fa", "#f59e0b", "#d62728"]
-            ax.bar(x, means, yerr=stds, capsize=3, color=colors, alpha=0.9)
-            ax.set_title(f"{ratio:g}% labeled data")
-            ax.set_xticks(x, labels)
-            ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-            for idx, value in enumerate(means):
-                ax.text(idx, value + 0.01, f"{value:.3f}", ha="center", fontsize=8)
-
-        axes[0].set_ylabel("Test Macro-F1")
-        axes[2].set_ylabel("Test Macro-F1")
-        fig.suptitle("Loss ablation for MAE + AdapterMetricNet", y=0.98)
-        fig.tight_layout()
-
-        path = os.path.join(self.figure_dir, "ablation_loss_components.png")
-        fig.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"saved figure: {path}")
-
-    def _generate_ablation_tables(self):
-        rows = self._load_ablation_summary()
-        row_map = {(r["ratio"], r["variant"]): r for r in rows}
-        table_rows = []
-
-        for ratio in sorted({r["ratio"] for r in rows}):
-            ce = row_map[(ratio, "ce")]["mean_macro_f1"]
-            ce_fixed = row_map[(ratio, "ce_fixed_pm")]["mean_macro_f1"]
-            cew_fixed = row_map[(ratio, "cew_fixed_pm")]["mean_macro_f1"]
-            cew_csa = row_map[(ratio, "cew_csa_pm")]["mean_macro_f1"]
-            table_rows.append(
-                {
-                    "ratio": ratio,
-                    "ce": ce,
-                    "ce_fixed_pm": ce_fixed,
-                    "cew_fixed_pm": cew_fixed,
-                    "cew_csa_pm": cew_csa,
-                    "fixed_pm_gain_vs_ce": ce_fixed - ce,
-                    "class_weight_gain": cew_fixed - ce_fixed,
-                    "csa_pm_gain_vs_fixed_pm": cew_csa - cew_fixed,
-                    "csa_pm_gain_vs_ce": cew_csa - ce,
-                }
+        data.setdefault("summary", {})
+        for (ratio, method), items in grouped.items():
+            data["summary"].setdefault(ratio, {})
+            summary = data["summary"][ratio].setdefault(
+                method,
+                {"runs": len(items), "method_label": METHOD_LABELS.get(method, method)},
             )
+            for metric, _ in METRICS + [("accuracy", "Accuracy"), ("weighted_f1", "Weighted F1")]:
+                values = [float(run["test"].get(metric, 0.0)) for run in items]
+                summary[f"{metric}_mean"], summary[f"{metric}_std"] = self._mean_std(values)
+                summary[f"{metric}_list"] = values
+
+    def _method_order(self, data, preferred):
+        methods = set()
+        for ratio_summary in data["summary"].values():
+            methods.update(ratio_summary.keys())
+        ordered = [method for method in preferred if method in methods]
+        ordered.extend(sorted(methods - set(ordered)))
+        return ordered
+
+    def _save_main_metric_tables(self, domain, data):
+        rows_long = []
+        for metric, label in METRICS:
+            methods = self._method_order(data, MAIN_ORDER)
+            ratios = self._ratios(data)
+            headers = ["Method"] + [f"{self._ratio_label(r)} {label}" for r in ratios] + [f"Average {label}"]
+            rows = []
+
+            for method in methods:
+                row = {"Method": METHOD_LABELS.get(method, method)}
+                means = []
+                for ratio in ratios:
+                    item = data["summary"].get(ratio, {}).get(method)
+                    if item is None:
+                        row[f"{self._ratio_label(ratio)} {label}"] = ""
+                        continue
+                    mean = item[f"{metric}_mean"]
+                    std = item[f"{metric}_std"]
+                    row[f"{self._ratio_label(ratio)} {label}"] = self._fmt(mean, std)
+                    means.append(mean)
+                    rows_long.append(
+                        {
+                            "domain": domain,
+                            "metric": label,
+                            "ratio": self._ratio_label(ratio),
+                            "method": METHOD_LABELS.get(method, method),
+                            "mean": mean,
+                            "std": std,
+                        }
+                    )
+                row[f"Average {label}"] = f"{np.mean(means):.4f}" if means else ""
+                rows.append(row)
+
+            stem = f"{domain}_main_{metric}_table"
+            self._save_csv(f"{stem}.csv", rows, headers)
+            self._save_md(f"{stem}.md", rows, headers)
 
         self._save_csv(
-            "ablation_core_deltas.csv",
-            table_rows,
-            [
-                "ratio",
-                "ce",
-                "ce_fixed_pm",
-                "cew_fixed_pm",
-                "cew_csa_pm",
-                "fixed_pm_gain_vs_ce",
-                "class_weight_gain",
-                "csa_pm_gain_vs_fixed_pm",
-                "csa_pm_gain_vs_ce",
-            ],
+            f"{domain}_main_all_metrics_long.csv",
+            rows_long,
+            ["domain", "metric", "ratio", "method", "mean", "std"],
         )
 
-    def _load_cross_domain_summary(self):
-        paths = [
-            "results/cross_domain/cross_domain_results.json",
-            "results/cross_domain/cross_domain_results_0p1.json",
-        ]
-        merged = {}
-
-        for path in paths:
-            if not os.path.exists(path):
-                continue
-
-            data = self._load_json(path)
-            for ratio, summary in data["summary"].items():
-                for key, values in summary.items():
-                    _, variant = key.split("::", 1)
-                    ratio_value = float(ratio)
-                    merged[(ratio_value, variant)] = {
-                        "ratio": ratio_value,
-                        "variant": variant,
-                        "mean_macro_f1": values["mean_macro_f1"],
-                        "std_macro_f1": values["std_macro_f1"],
-                        "runs": values["runs"],
-                        "source_file": path,
-                    }
-
-        if not merged:
-            raise FileNotFoundError("no cross-domain result files found")
-
-        rows = list(merged.values())
-        rows.sort(key=lambda r: (r["ratio"], r["variant"]))
-        return rows
-
-    def _generate_cross_domain_figures(self):
-        rows = self._load_cross_domain_summary()
-        ratios = sorted({r["ratio"] for r in rows})
-        variant_order = [
-            "random",
-            "mae_pretrained_finetune",
-            "mae_pretrained_frozen",
-            "mae_pretrained_coral",
-            "mae_pretrained_mmd",
-        ]
-        label_map = {
-            "random": "Random",
-            "mae_pretrained_finetune": "MAE\nfinetune",
-            "mae_pretrained_frozen": "MAE\nfrozen",
-            "mae_pretrained_coral": "MAE\n+CORAL",
-            "mae_pretrained_mmd": "MAE\n+MMD",
-        }
-        colors = {
-            "random": "#6b7280",
-            "mae_pretrained_finetune": "#2ca02c",
-            "mae_pretrained_frozen": "#ff7f0e",
-            "mae_pretrained_coral": "#d62728",
-            "mae_pretrained_mmd": "#1f77b4",
-        }
-        row_map = {(r["ratio"], r["variant"]): r for r in rows}
-        variants = [
-            variant
-            for variant in variant_order
-            if any((ratio, variant) in row_map for ratio in ratios)
-        ]
-
-        fig, ax = plt.subplots(figsize=(9, 5))
+    def _plot_grouped_macro_f1(self, domain, data):
+        methods = self._method_order(data, MAIN_ORDER)
+        ratios = self._ratios(data)
         x = np.arange(len(ratios))
-        width = min(0.18, 0.8 / max(len(variants), 1))
-        center_offset = (len(variants) - 1) / 2.0
+        width = 0.8 / max(len(methods), 1)
 
-        for idx, variant in enumerate(variants):
-            means = [row_map.get((ratio, variant), {}).get("mean_macro_f1", np.nan) for ratio in ratios]
-            stds = [row_map.get((ratio, variant), {}).get("std_macro_f1", 0.0) for ratio in ratios]
+        fig, ax = plt.subplots(figsize=(10, 5.2))
+        for idx, method in enumerate(methods):
+            means = [data["summary"][ratio][method]["macro_f1_mean"] for ratio in ratios]
+            stds = [data["summary"][ratio][method]["macro_f1_std"] for ratio in ratios]
+            offset = (idx - (len(methods) - 1) / 2.0) * width
             ax.bar(
-                x + (idx - center_offset) * width,
+                x + offset,
                 means,
                 width,
                 yerr=stds,
                 capsize=3,
-                color=colors[variant],
-                label=label_map[variant],
+                label=METHOD_LABELS.get(method, method),
+                color=COLORS.get(method),
+                edgecolor="white",
+                linewidth=0.6,
             )
 
-        ax.set_xticks(x, [f"{ratio:g}%" for ratio in ratios])
-        ax.set_xlabel("Labeled target ratio")
-        ax.set_ylabel("Test Macro-F1")
-        ax.set_title("UNSW-NB15 to CICIDS transfer with MAE")
+        ax.set_xticks(x, [self._ratio_label(ratio) for ratio in ratios])
+        ax.set_xlabel("Target labeled sample ratio")
+        ax.set_ylabel("Macro-F1")
+        ax.set_ylim(0.0, min(1.0, self._max_metric(data, "macro_f1") + 0.12))
+        ax.set_title(f"{self._domain_title(domain)}: Macro-F1 comparison")
         ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-        ax.legend(frameon=False)
+        ax.legend(frameon=False, ncol=3)
         fig.tight_layout()
+        self._save_fig(fig, f"{domain}_main_macro_f1_grouped_bar.png")
 
-        path = os.path.join(self.figure_dir, "cross_domain_mae_macro_f1_bars.png")
-        fig.savefig(path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"saved figure: {path}")
-
-    def _generate_cross_domain_table(self):
-        rows = self._load_cross_domain_summary()
-        row_map = {(r["ratio"], r["variant"]): r for r in rows}
-        table_rows = []
-
-        for ratio in sorted({r["ratio"] for r in rows}):
-            random_row = row_map.get((ratio, "random"))
-            random_mean = random_row["mean_macro_f1"] if random_row else np.nan
-            for row in [r for r in rows if r["ratio"] == ratio]:
-                table_rows.append(
+    def _save_gain_table_and_plot(self, main_data):
+        rows = []
+        for domain, data in main_data.items():
+            for ratio in self._ratios(data):
+                target = data["summary"][ratio].get("ir_scb_focal")
+                baselines = []
+                for method in MAIN_ORDER:
+                    if method == "ir_scb_focal":
+                        continue
+                    item = data["summary"][ratio].get(method)
+                    if item:
+                        baselines.append((method, item["macro_f1_mean"]))
+                if not target or not baselines:
+                    continue
+                best_method, best_value = max(baselines, key=lambda item: item[1])
+                ir_value = target["macro_f1_mean"]
+                rows.append(
                     {
-                        "ratio": ratio,
-                        "variant": row["variant"],
-                        "mean_macro_f1": row["mean_macro_f1"],
-                        "std_macro_f1": row["std_macro_f1"],
-                        "runs": row["runs"],
-                        "gain_vs_random": row["mean_macro_f1"] - random_mean,
-                        "source_file": row.get("source_file", ""),
+                        "domain": domain,
+                        "ratio": self._ratio_label(ratio),
+                        "best_baseline": METHOD_LABELS.get(best_method, best_method),
+                        "best_baseline_macro_f1": best_value,
+                        "ir_scb_focal_macro_f1": ir_value,
+                        "delta_macro_f1": ir_value - best_value,
                     }
                 )
 
         self._save_csv(
-            "cross_domain_summary.csv",
-            table_rows,
+            "ir_scb_focal_gain_over_best_baseline.csv",
+            rows,
+            ["domain", "ratio", "best_baseline", "best_baseline_macro_f1", "ir_scb_focal_macro_f1", "delta_macro_f1"],
+        )
+
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.8), sharey=True)
+        for ax, domain in zip(axes, ["indomain", "crossdomain"]):
+            domain_rows = [row for row in rows if row["domain"] == domain]
+            x = np.arange(len(domain_rows))
+            values = [row["delta_macro_f1"] for row in domain_rows]
+            colors = ["#d62728" if value >= 0 else "#6b7280" for value in values]
+            ax.bar(x, values, color=colors, width=0.62)
+            ax.axhline(0.0, color="black", linewidth=1)
+            ax.set_xticks(x, [row["ratio"] for row in domain_rows])
+            ax.set_title(self._domain_title(domain))
+            ax.set_xlabel("Target labeled sample ratio")
+            ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+            for idx, value in enumerate(values):
+                va = "bottom" if value >= 0 else "top"
+                y = value + (0.004 if value >= 0 else -0.004)
+                ax.text(idx, y, f"{value:+.4f}", ha="center", va=va, fontsize=9)
+        axes[0].set_ylabel("Delta Macro-F1 over strongest baseline")
+        fig.suptitle("IR-SCB-Focal gain over the strongest baseline", y=1.02)
+        fig.tight_layout()
+        self._save_fig(fig, "ir_scb_focal_gain_over_best_baseline.png")
+
+    def _plot_rho_mechanism(self, data):
+        runs = [run for run in self._runs(data) if run["method"] == "ir_scb_focal"]
+        grouped = defaultdict(list)
+        for run in runs:
+            info = run.get("loss_info", {})
+            grouped[str(run["ratio"])].append(info)
+
+        rows = []
+        ratios = sorted(grouped.keys(), key=lambda item: float(item))
+        values = {key: [] for key in ["imbalance_ratio", "rho_ir", "ratio_decay", "rho"]}
+        for ratio in ratios:
+            infos = grouped[ratio]
+            row = {"ratio": self._ratio_label(ratio)}
+            for key in values:
+                mean, std = self._mean_std([float(info.get(key, 0.0)) for info in infos])
+                values[key].append(mean)
+                row[f"{key}_mean"] = mean
+                row[f"{key}_std"] = std
+            rows.append(row)
+
+        self._save_csv(
+            "rho_adaptation_mechanism_values.csv",
+            rows,
             [
                 "ratio",
-                "variant",
-                "mean_macro_f1",
-                "std_macro_f1",
-                "runs",
-                "gain_vs_random",
-                "source_file",
+                "imbalance_ratio_mean",
+                "imbalance_ratio_std",
+                "rho_ir_mean",
+                "rho_ir_std",
+                "ratio_decay_mean",
+                "ratio_decay_std",
+                "rho_mean",
+                "rho_std",
             ],
         )
 
+        x = np.arange(len(ratios))
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
+
+        axes[0].bar(x, values["imbalance_ratio"], color="#9ca3af", width=0.58)
+        axes[0].set_xticks(x, [self._ratio_label(ratio) for ratio in ratios])
+        axes[0].set_xlabel("Target labeled sample ratio")
+        axes[0].set_ylabel("Imbalance Ratio (IR)")
+        axes[0].set_title("Class imbalance")
+        axes[0].grid(True, axis="y", linestyle="--", alpha=0.35)
+
+        axes[1].plot(x, values["rho_ir"], marker="o", linewidth=2.2, color="#1f77b4", label="rho_ir")
+        axes[1].plot(x, values["ratio_decay"], marker="s", linewidth=2.2, color="#2ca02c", label="ratio_decay")
+        axes[1].plot(x, values["rho"], marker="^", linewidth=2.4, color="#d62728", label="final rho")
+        axes[1].set_xticks(x, [self._ratio_label(ratio) for ratio in ratios])
+        axes[1].set_xlabel("Target labeled sample ratio")
+        axes[1].set_ylabel("Value")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[1].set_title("Adaptive rho mechanism")
+        axes[1].grid(True, axis="y", linestyle="--", alpha=0.35)
+        axes[1].legend(frameon=False)
+
+        fig.suptitle("IR-SCB-Focal: imbalance-ratio and ratio-aware rho adaptation", y=1.02)
+        fig.tight_layout()
+        self._save_fig(fig, "rho_adaptation_mechanism.png")
+
+    def _save_ablation_tables(self, ablation_data):
+        rows = []
+        for domain, data in ablation_data.items():
+            for ratio in self._ratios(data):
+                for method in self._method_order(data, ABLATION_ORDER):
+                    item = data["summary"][ratio].get(method)
+                    if not item:
+                        continue
+                    rows.append(
+                        {
+                            "domain": domain,
+                            "ratio": self._ratio_label(ratio),
+                            "method": METHOD_LABELS.get(method, method),
+                            "macro_f1": self._fmt(item["macro_f1_mean"], item["macro_f1_std"]),
+                            "balanced_accuracy": self._fmt(item["balanced_accuracy_mean"], item["balanced_accuracy_std"]),
+                            "rare_recall": self._fmt(item["rare_recall_mean"], item["rare_recall_std"]),
+                        }
+                    )
+        self._save_csv(
+            "focal_family_ablation_all_metrics.csv",
+            rows,
+            ["domain", "ratio", "method", "macro_f1", "balanced_accuracy", "rare_recall"],
+        )
+
+    def _plot_key_ablation_bars(self, ablation_data):
+        scenarios = [
+            ("indomain", "1.0", "In-domain 1%"),
+            ("crossdomain", "0.1", "Cross-domain 0.1%"),
+        ]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=True)
+        for ax, (domain, ratio, title) in zip(axes, scenarios):
+            data = ablation_data[domain]
+            methods = self._method_order(data, ABLATION_ORDER)
+            x = np.arange(len(methods))
+            means = [data["summary"][ratio][method]["macro_f1_mean"] for method in methods]
+            stds = [data["summary"][ratio][method]["macro_f1_std"] for method in methods]
+            ax.bar(
+                x,
+                means,
+                yerr=stds,
+                capsize=4,
+                color=[COLORS.get(method) for method in methods],
+                width=0.66,
+                edgecolor="white",
+                linewidth=0.6,
+            )
+            ax.set_xticks(x, [METHOD_LABELS.get(method, method) for method in methods], rotation=25, ha="right")
+            ax.set_xlabel("Focal-family variant")
+            ax.set_title(title)
+            ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        axes[0].set_ylabel("Macro-F1")
+        axes[0].set_ylim(0.0, 0.75)
+        fig.suptitle("Focal-family ablation on representative scenarios", y=1.02)
+        fig.tight_layout()
+        self._save_fig(fig, "focal_family_ablation_key_scenarios.png")
+
+    def _plot_ablation_heatmaps(self, ablation_data):
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.2), sharey=True, constrained_layout=True)
+        heatmap_values = []
+        prepared = {}
+
+        for domain, data in ablation_data.items():
+            methods = self._method_order(data, ABLATION_ORDER)
+            ratios = self._ratios(data)
+            matrix = np.asarray(
+                [
+                    [data["summary"][ratio][method]["macro_f1_mean"] for ratio in ratios]
+                    for method in methods
+                ],
+                dtype=np.float64,
+            )
+            prepared[domain] = (methods, ratios, matrix)
+            heatmap_values.extend(matrix.reshape(-1).tolist())
+
+        vmin = min(heatmap_values) if heatmap_values else 0.0
+        vmax = max(heatmap_values) if heatmap_values else 1.0
+
+        for ax, domain in zip(axes, ["indomain", "crossdomain"]):
+            methods, ratios, matrix = prepared[domain]
+            image = ax.imshow(matrix, cmap="YlOrRd", aspect="auto", vmin=vmin, vmax=vmax)
+            ax.set_xticks(np.arange(len(ratios)), [self._ratio_label(ratio) for ratio in ratios])
+            ax.set_yticks(np.arange(len(methods)), [METHOD_LABELS.get(method, method) for method in methods])
+            ax.set_xlabel("Target labeled sample ratio")
+            ax.set_title(self._domain_title(domain))
+
+            for row in range(matrix.shape[0]):
+                for col in range(matrix.shape[1]):
+                    value = matrix[row, col]
+                    text_color = "white" if value > (vmin + vmax) / 2.0 else "black"
+                    ax.text(col, row, f"{value:.3f}", ha="center", va="center", color=text_color, fontsize=9)
+
+        axes[0].set_ylabel("Focal-family variant")
+        fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.88, label="Macro-F1")
+        fig.suptitle("Focal-family ablation Macro-F1 heatmap")
+        self._save_fig(fig, "focal_family_ablation_macro_f1_heatmap.png")
+
+    def _plot_seed_stability(self, main_data):
+        scenarios = [
+            ("indomain", "1.0", "In-domain 1%"),
+            ("crossdomain", "0.1", "Cross-domain 0.1%"),
+        ]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharey=False)
+        for ax, (domain, ratio, title) in zip(axes, scenarios):
+            data = main_data[domain]
+            runs = self._runs(data)
+            methods = self._method_order(data, MAIN_ORDER)
+            for idx, method in enumerate(methods):
+                vals = [
+                    run["test"]["macro_f1"]
+                    for run in runs
+                    if run["method"] == method and self._ratio_key(run["ratio"]) == ratio
+                ]
+                if not vals:
+                    continue
+                jitter = np.linspace(-0.08, 0.08, len(vals)) if len(vals) > 1 else [0.0]
+                ax.scatter(
+                    np.full(len(vals), idx) + jitter,
+                    vals,
+                    color=COLORS.get(method),
+                    s=36,
+                    alpha=0.85,
+                    zorder=3,
+                )
+                ax.hlines(np.mean(vals), idx - 0.22, idx + 0.22, color="black", linewidth=1.4)
+            ax.set_xticks(np.arange(len(methods)), [METHOD_LABELS.get(m, m) for m in methods], rotation=25, ha="right")
+            ax.set_ylabel("Macro-F1")
+            ax.set_title(title)
+            ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        fig.suptitle("Seed-level Macro-F1 stability", y=1.02)
+        fig.tight_layout()
+        self._save_fig(fig, "seed_level_stability_key_scenarios.png")
+
+    @staticmethod
+    def _domain_title(domain):
+        if domain == "indomain":
+            return "In-domain"
+        if domain == "crossdomain":
+            return "Cross-domain"
+        return domain
+
+    @staticmethod
+    def _max_metric(data, metric):
+        max_value = 0.0
+        for ratio_summary in data["summary"].values():
+            for item in ratio_summary.values():
+                max_value = max(max_value, float(item.get(f"{metric}_mean", 0.0)))
+        return max_value
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate final IR-SCB-Focal paper tables and figures")
+    parser.add_argument("--result-dir", default=RESULT_DIR)
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    args = parser.parse_args()
+    PaperFigureBuilder(args.result_dir, args.output_dir).generate_all()
+
 
 if __name__ == "__main__":
-    PaperFigures().generate_all()
+    main()
